@@ -9,17 +9,86 @@
 #include <netinet/ip.h>
 #include <assert.h>
 
+#include <fcntl.h>
+#include <poll.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <netinet/ip.h>
+#include <vector>
+// using namespace std;
+
+// maximum size of message in bytes
+const size_t k_max_msg = 4096;
+
+enum
+{
+    STATE_REQ = 0, // mark connection to accept requests
+    STATE_RES = 1, // mark connection to respond
+    STATE_END = 2, // mark connection for deletion
+};
+
+struct Conn
+{
+    int fd = -1;
+    uint32_t state = 0; // either STATE_REQ or STATE_RES
+    // buffer for reading
+    size_t rbuf_size = 0;
+    uint8_t rbuf[4 + k_max_msg];
+    // buffer for writing
+    size_t wbuf_size = 0;
+    size_t wbuf_sent = 0;
+    uint8_t wbuf[4 + k_max_msg];
+};
+
+// Prints a given message to the standard error stream.
 static void msg(const char *msg)
 {
+    // fprintf prints to any output stream, as opposed to printf which prints to standard output only
     fprintf(stderr, "%s\n", msg);
 }
 
+// Aborts from the program after printing the given message
 static void die(const char *msg)
 {
     int err = errno;
     fprintf(stderr, " [%d] %s\n", err, msg);
     abort();
 }
+
+// set a given fd to nonblocking so as to be compatible with an event loop
+static void set_fd_to_nonblocking(int fd)
+{
+    errno = 0;
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (errno)
+    {
+        die("fcntl error");
+        return;
+    }
+    flags |= O_NONBLOCK;
+
+    errno = 0;
+    (void)fcntl(fd, F_SETFL, 0);
+    if (errno)
+    {
+        die("fcntl error");
+        return;
+    }
+}
+
+// puts the new connection into the fd2conn vector of connections
+static void conn_put(std::vector<Conn *> &fd2conn, struct Conn *conn)
+{
+    if (fd2conn.size() <= (size_t)conn->fd)
+    {
+        fd2conn.resize(conn->fd + 1);
+    }
+    // the fd value serves as the index or the key for the struct Conn object
+    fd2conn[conn->fd] = conn;
+}
+
+
+
 
 static int32_t read_full(int fd, char *buf, size_t n)
 {
@@ -52,8 +121,6 @@ static int32_t write_all(int fd, const char *buf, size_t n)
     }
     return 0;
 }
-
-const size_t k_max_msg = 4096;
 
 static int32_t one_request(int connfd)
 {

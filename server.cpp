@@ -26,12 +26,14 @@ struct Conn
 {
     int fd = -1;
     uint32_t state = 0; // either STATE_REQ or STATE_RES
-    // buffer for reading
+    // current size of the read buffer
     size_t rbuf_size = 0;
+    // buffer for reading
     uint8_t rbuf[4 + k_max_msg];
-    // buffer for writing
+    // current size of the write buffer
     size_t wbuf_size = 0;
     size_t wbuf_sent = 0;
+    // buffer for writing
     uint8_t wbuf[4 + k_max_msg];
 };
 
@@ -71,7 +73,7 @@ static void set_fd_to_nonblocking(int fd)
     }
 }
 
-// puts the new connection into the fd2conn vector of connections
+// puts the new connection into the fd2conn vector of connections, mapped by fd keys
 static void conn_put(std::vector<Conn *> &fd2conn, struct Conn *conn)
 {
     if (fd2conn.size() <= (size_t)conn->fd)
@@ -116,6 +118,7 @@ static int32_t accept_new_conn(std::vector<Conn *> &fd2conn, int fd)
     return 0;
 }
 
+// definitions for functions that will be used later
 static void state_req(Conn *conn);
 static void state_res(Conn *conn);
 
@@ -135,13 +138,14 @@ static bool try_one_request(Conn *conn)
         msg("too long");
         conn->state = STATE_END;
         return false;
-        // why do we do this, set it to END
+        // we got a msg thats too long, so we are removing the client
+        // this behaviour can be changed
     }
     if (4 + len > conn->rbuf_size)
     {
-        // not enough data in the buffer. retry in the next iteration
+        // we have not got the entire message in the read buffer yet, only a part of it
+        // so we defer to process it until we get it all
         return false;
-        // why do we do this
     }
 
     // got one request, print it
@@ -182,7 +186,7 @@ static bool try_fill_buffer(Conn *conn)
 
     if (rv < 0 && errno == EAGAIN)
     {
-        // got EAGAIN, stop.
+        // got EAGAIN, stop. come out of the loop
         return false;
     }
     if (rv < 0)
@@ -208,7 +212,7 @@ static bool try_fill_buffer(Conn *conn)
     conn->rbuf_size += (size_t)rv;
     assert(conn->rbuf_size <= sizeof(conn->rbuf));
 
-    // Try to process requests one by one.
+    // to enable pipelining, clients can send multiple requests one after the other
     while (try_one_request(conn))
     {
     }
@@ -262,6 +266,7 @@ static void state_res(Conn *conn)
     }
 }
 
+// helper function that calls the correct function depending on the connection state
 static void connection_io(Conn *conn)
 {
     if (conn->state == STATE_REQ)
@@ -277,85 +282,6 @@ static void connection_io(Conn *conn)
         assert(0);
         // unexpected
     }
-}
-
-static int32_t read_full(int fd, char *buf, size_t n)
-{
-    while (n > 0)
-    {
-        ssize_t rv = read(fd, buf, n);
-        if (rv <= 0)
-        {
-            return -1; // error, or unexpected EOF
-        }
-        assert((size_t)rv <= n);
-        n -= (size_t)rv;
-        buf += rv;
-    }
-    return 0;
-}
-
-static int32_t write_all(int fd, const char *buf, size_t n)
-{
-    while (n > 0)
-    {
-        ssize_t rv = write(fd, buf, n);
-        if (rv <= 0)
-        {
-            return -1; // error
-        }
-        assert((size_t)rv <= n);
-        n -= (size_t)rv;
-        buf += rv;
-    }
-    return 0;
-}
-
-static int32_t one_request(int connfd)
-{
-    char rbuf[4 + k_max_msg + 1];
-    errno = 0;
-    int32_t err = read_full(connfd, rbuf, 4);
-    if (err)
-    {
-        if (errno == 0)
-        {
-            msg("EOF");
-        }
-        else
-        {
-            msg("read() error");
-        }
-        return err;
-    }
-
-    uint32_t len = 0;
-    memcpy(&len, rbuf, 4);
-    if (len > k_max_msg)
-    {
-        msg("too long");
-        return -1;
-    }
-
-    // request body
-    err = read_full(connfd, &rbuf[4], len);
-    if (err)
-    {
-        msg("read() error");
-        return err;
-    }
-
-    // do something
-    rbuf[4 + len] = '\0';
-    printf("client says: %s\n", &rbuf[4]);
-
-    // reply using the same protocol
-    const char reply[] = "world";
-    char wbuf[4 + sizeof(reply)];
-    len = (uint32_t)strlen(reply);
-    memcpy(wbuf, &len, 4);
-    memcpy(&wbuf[4], reply, len);
-    return write_all(connfd, wbuf, 4 + len);
 }
 
 int main()
@@ -399,7 +325,7 @@ int main()
     {
         // prepare the arguments of the poll()
         poll_args.clear();
-        // listenig fd is put in first position for our convenience
+        // listening fd is put in first position for our convenience
         struct pollfd pfd = {fd, POLLIN, 0};
         poll_args.push_back(pfd);
         // connection fds
@@ -415,7 +341,8 @@ int main()
         }
 
         // poll for active fds
-        //  the timeout argument doesn't matter much here
+        // the timeout argument doesn't matter much here
+        // this line is the only blocking line
         int rv = poll(poll_args.data(), (nfds_t)poll_args.size(), 1000);
         if (rv < 0)
         {
@@ -423,12 +350,17 @@ int main()
         }
 
         // process active connections
+
+        // start from index 1 as index 0 is the listening socket
         for (size_t i = 1; i < poll_args.size(); ++i)
         {
+            // some event did occur on that socket
             if (poll_args[i].revents)
             {
                 Conn *conn = fd2conn[poll_args[i].fd];
                 connection_io(conn);
+
+                // socket is marked for deletion
                 if (conn->state == STATE_END)
                 {
                     // client closed normally, or something bad happened.
